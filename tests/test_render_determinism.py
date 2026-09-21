@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +11,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ARTIFACTS = ROOT / "tests" / "artifacts"
 sys.path.insert(0, str(ROOT))
 from climb_cut import render  # noqa: E402
 
@@ -53,40 +53,41 @@ def decoded_frames(path: Path) -> list[np.ndarray]:
 
 class RenderDeterminismTest(unittest.TestCase):
     def test_threaded_and_sequential_frames_match(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            write_source(root / "first.mp4", (25, 70, 190), 0)
-            write_source(root / "second.mp4", (180, 40, 35), 9)
-            descriptor = {
-                "version": 1,
-                "route": "determinism-test",
-                "output": {"fps": 30, "size": list(SIZE), "duration": 0.5},
-                "holds": [{"id": "start", "at": 0}, {"id": "blend", "at": 0.25}],
-                "tracks": [
-                    {"id": "first", "source": "first.mp4", "outcome": "unknown", "enabled": True,
-                     "translation": [3, -2], "anchors": {
-                         "start": {"source": 0, "opacity": 1},
-                         "blend": {"source": 0.25, "opacity": 0.2},
-                     }},
-                    {"id": "second", "source": "second.mp4", "outcome": "unknown", "enabled": True,
-                     "translation": [-2, 1], "anchors": {
-                         "start": {"source": 0.05, "opacity": 0.3},
-                         "blend": {"source": 0.3, "opacity": 1},
-                     }},
-                ],
-            }
-            route = root / "route.json"
-            route.write_text(json.dumps(descriptor), encoding="utf-8")
-            sequential, threaded = root / "sequential.mp4", root / "threaded.mp4"
+        # Keep fixtures and results around for visual inspection after tests.
+        # They are generated files and ignored by Git.
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        write_source(ARTIFACTS / "first.mp4", (25, 70, 190), 0)
+        write_source(ARTIFACTS / "second.mp4", (180, 40, 35), 9)
+        descriptor = {
+            "version": 1,
+            "route": "determinism-test",
+            "output": {"fps": 30, "size": list(SIZE), "duration": 0.5},
+            "holds": [{"id": "start", "at": 0}, {"id": "blend", "at": 0.25}],
+            "tracks": [
+                {"id": "first", "source": "first.mp4", "outcome": "unknown", "enabled": True,
+                 "translation": [3, -2], "anchors": {
+                     "start": {"source": 0, "opacity": 1},
+                     "blend": {"source": 0.25, "opacity": 0.2},
+                 }},
+                {"id": "second", "source": "second.mp4", "outcome": "unknown", "enabled": True,
+                 "translation": [-2, 1], "anchors": {
+                     "start": {"source": 0.05, "opacity": 0.3},
+                     "blend": {"source": 0.3, "opacity": 1},
+                 }},
+            ],
+        }
+        route = ARTIFACTS / "route.json"
+        route.write_text(json.dumps(descriptor), encoding="utf-8")
+        sequential, threaded = ARTIFACTS / "sequential.mp4", ARTIFACTS / "threaded.mp4"
 
-            render(route, sequential, single_threaded=True)
-            render(route, threaded)
+        render(route, sequential, single_threaded=True)
+        render(route, threaded)
 
-            expected, actual = decoded_frames(sequential), decoded_frames(threaded)
-            self.assertEqual(len(expected), 15)
-            self.assertEqual(len(actual), len(expected))
-            for index, (left, right) in enumerate(zip(expected, actual)):
-                np.testing.assert_array_equal(left, right, err_msg=f"output frame {index} differs")
+        expected, actual = decoded_frames(sequential), decoded_frames(threaded)
+        self.assertEqual(len(expected), 15)
+        self.assertEqual(len(actual), len(expected))
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            np.testing.assert_array_equal(left, right, err_msg=f"output frame {index} differs")
 
 
 if __name__ == "__main__":

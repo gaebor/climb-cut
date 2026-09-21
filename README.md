@@ -58,6 +58,8 @@ The test suite generates two small synthetic input clips, renders them through b
 uv run python -m unittest tests/test_render_determinism.py -v
 ```
 
+Afterward, inspect its generated sources and both outputs in `tests/artifacts/`.
+
 For a manual sequential performance baseline on a real route, add `--single-threaded` to `render`.
 
 `init` does not guess where a climb begins: its `start` value is deliberately a whole-video placeholder. Set it to the real climbing moment before judging alignment. Add shared holds only where you want a retimed interval; no finish anchor is needed.
