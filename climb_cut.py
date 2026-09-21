@@ -7,7 +7,7 @@ short, reviewable JSON change.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import hashlib
 import json
 import math
@@ -186,7 +186,17 @@ def source_signature(source: Path) -> dict[str, int]:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
-def build_frame_cache(source: Path, directory: Path, max_height: int = 720, progress_position: int = 0) -> dict[str, Any]:
+def reported_frame_count(source: Path) -> int | None:
+    """Best-effort container count for a cache progress bar."""
+    cap = cv2.VideoCapture(str(source))
+    try:
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+    finally:
+        cap.release()
+
+
+def build_frame_cache(source: Path, directory: Path, max_height: int = 720,
+                      progress_queue: Any | None = None, progress_id: int | None = None) -> dict[str, Any]:
     """Decode once and save a timestamp-indexed, preview-sized JPEG cache."""
     directory.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(source))
@@ -195,7 +205,12 @@ def build_frame_cache(source: Path, directory: Path, max_height: int = 720, prog
     files: list[str] = []
     frame_number = 0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
-    progress = tqdm(total=total, desc=f"Cache {source.name}", unit="frame", position=progress_position, leave=True, dynamic_ncols=True)
+    # A process may not write a tqdm bar directly: Windows terminals cannot
+    # reliably interleave their cursor-control sequences.  In that case the
+    # parent process owns the bars and receives small batched increments.
+    progress = None if progress_queue is not None else tqdm(
+        total=total, desc=f"Cache {source.name}", unit="frame", dynamic_ncols=True)
+    pending_progress = 0
     try:
         while True:
             ok, image = cap.read()
@@ -214,19 +229,23 @@ def build_frame_cache(source: Path, directory: Path, max_height: int = 720, prog
             cv2.imwrite(str(directory / filename), image, [cv2.IMWRITE_JPEG_QUALITY, 88])
             files.append(filename)
             frame_number += 1
-            progress.update(1)
+            if progress is not None:
+                progress.update(1)
+            else:
+                pending_progress += 1
+                if pending_progress >= 16:
+                    progress_queue.put((progress_id, pending_progress))
+                    pending_progress = 0
     finally:
         cap.release()
-        progress.close()
+        if progress is not None:
+            progress.close()
+        elif pending_progress:
+            progress_queue.put((progress_id, pending_progress))
     data = {"version": 2, "source": str(source.resolve()), "signature": source_signature(source),
             "max_height": max_height, "timestamps": timestamps, "files": files}
     (directory / "index.json").write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
     return data
-
-
-def initialise_cache_worker(progress_lock: Any) -> None:
-    """Give independently spawned cache processes one shared tqdm lock."""
-    tqdm.set_lock(progress_lock)
 
 
 def existing_frame_cache(descriptor_dir: Path, source: Path, max_height: int | None = 720) -> tuple[Path, dict[str, Any] | None]:
@@ -254,16 +273,40 @@ def descriptor_caches(d: dict[str, Any], base: Path, max_height: int | None = 72
     if missing:
         # Cache jobs share neither decoder state nor pixels. Separate Python
         # processes bypass the GIL and give FFmpeg/JPEG work independent CPU
-        # scheduling; the manager lock keeps the per-video tqdm bars tidy.
+        # scheduling.  Only this parent process draws tqdm bars, which avoids
+        # garbled cursor sequences from multiple Windows child processes.
         with mp.Manager() as manager:
-            progress_lock = manager.RLock()
-            tqdm.set_lock(progress_lock)
-            with ProcessPoolExecutor(max_workers=len(missing), initializer=initialise_cache_worker, initargs=(progress_lock,)) as pool:
-                futures = {pool.submit(build_frame_cache, source, directory, max_height or 720, position): (source, directory)
-                           for position, (source, directory) in enumerate(missing)}
-                for future in as_completed(futures):
-                    source, directory = futures[future]
-                    resolved[source] = (directory, future.result())
+            updates = manager.Queue()
+            bars = [tqdm(total=reported_frame_count(source),
+                         desc=f"Cache {source.name}", unit="frame", position=position,
+                         leave=True, dynamic_ncols=True)
+                    for position, (source, _) in enumerate(missing)]
+            try:
+                with ProcessPoolExecutor(max_workers=len(missing)) as pool:
+                    futures = {pool.submit(build_frame_cache, source, directory, max_height or 720, updates, position): (source, directory, position)
+                               for position, (source, directory) in enumerate(missing)}
+                    while futures:
+                        try:
+                            while True:
+                                position, amount = updates.get_nowait()
+                                bars[position].update(amount)
+                        except queue.Empty:
+                            pass
+                        done, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            source, directory, position = futures.pop(future)
+                            data = future.result()
+                            if bars[position].n < len(data["timestamps"]):
+                                bars[position].update(len(data["timestamps"]) - bars[position].n)
+                            resolved[source] = (directory, data)
+                            # Container frame counts are estimates.  Make the
+                            # finished line honestly read 100%, even if a
+                            # decoder produced one fewer (or more) frame.
+                            bars[position].total = bars[position].n
+                            bars[position].refresh()
+            finally:
+                for bar in bars:
+                    bar.close()
     return [resolved[(base / tr["source"]).resolve()] for tr in d["tracks"]]
 
 

@@ -11,7 +11,7 @@ uv run python climb_cut.py init yellow-arete.json 20260915_101609.mp4 20260915_1
 uv run python climb_cut.py preview yellow-arete.json
 ```
 
-Before reviewing, build the fast preview cache once. This creates a `clips/<video-name>/` folder next to your descriptor, containing a small JPEG for every decoded input frame. JPEG names are their source presentation timestamps, and `index.json` maps timestamps to files. Missing source videos are cached in separate processes, with one tqdm bar per video. It may take a little while and use disk space, but all later seeking is cache-backed:
+Before reviewing, build the fast preview cache once. This creates a `clips/<video-name>/` folder next to your descriptor, containing a small JPEG for every decoded input frame. JPEG names are their source presentation timestamps, and `index.json` maps timestamps to files. Missing source videos are cached in separate processes; the main process draws one stable tqdm bar per video. It may take a little while and use disk space, but all later seeking is cache-backed:
 
 ```powershell
 uv run python climb_cut.py cache yellow-arete.json --height 720
