@@ -7,11 +7,10 @@ short, reviewable JSON change.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import json
 import math
-import multiprocessing as mp
 import os
 import queue
 import sys
@@ -271,42 +270,41 @@ def descriptor_caches(d: dict[str, Any], base: Path, max_height: int | None = 72
         if data is None: missing.append((source, directory))
         else: resolved[source] = (directory, data)
     if missing:
-        # Cache jobs share neither decoder state nor pixels. Separate Python
-        # processes bypass the GIL and give FFmpeg/JPEG work independent CPU
-        # scheduling.  Only this parent process draws tqdm bars, which avoids
-        # garbled cursor sequences from multiple Windows child processes.
-        with mp.Manager() as manager:
-            updates = manager.Queue()
-            bars = [tqdm(total=reported_frame_count(source),
-                         desc=f"Cache {source.name}", unit="frame", position=position,
-                         leave=True, dynamic_ncols=True)
-                    for position, (source, _) in enumerate(missing)]
-            try:
-                with ProcessPoolExecutor(max_workers=len(missing)) as pool:
-                    futures = {pool.submit(build_frame_cache, source, directory, max_height or 720, updates, position): (source, directory, position)
-                               for position, (source, directory) in enumerate(missing)}
-                    while futures:
-                        try:
-                            while True:
-                                position, amount = updates.get_nowait()
-                                bars[position].update(amount)
-                        except queue.Empty:
-                            pass
-                        done, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
-                        for future in done:
-                            source, directory, position = futures.pop(future)
-                            data = future.result()
-                            if bars[position].n < len(data["timestamps"]):
-                                bars[position].update(len(data["timestamps"]) - bars[position].n)
-                            resolved[source] = (directory, data)
-                            # Container frame counts are estimates.  Make the
-                            # finished line honestly read 100%, even if a
-                            # decoder produced one fewer (or more) frame.
-                            bars[position].total = bars[position].n
-                            bars[position].refresh()
-            finally:
-                for bar in bars:
-                    bar.close()
+        # OpenCV's decoding, resizing, and JPEG writing happen in native code,
+        # so threads can run them concurrently without process startup or IPC
+        # overhead. Only this parent thread draws tqdm bars, avoiding garbled
+        # cursor sequences from concurrent workers.
+        updates: queue.Queue[tuple[int, int]] = queue.Queue()
+        bars = [tqdm(total=reported_frame_count(source),
+                     desc=f"Cache {source.name}", unit="frame", position=position,
+                     leave=True, dynamic_ncols=True)
+                for position, (source, _) in enumerate(missing)]
+        try:
+            with ThreadPoolExecutor(max_workers=len(missing), thread_name_prefix="cache") as pool:
+                futures = {pool.submit(build_frame_cache, source, directory, max_height or 720, updates, position): (source, directory, position)
+                           for position, (source, directory) in enumerate(missing)}
+                while futures:
+                    try:
+                        while True:
+                            position, amount = updates.get_nowait()
+                            bars[position].update(amount)
+                    except queue.Empty:
+                        pass
+                    done, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        source, directory, position = futures.pop(future)
+                        data = future.result()
+                        if bars[position].n < len(data["timestamps"]):
+                            bars[position].update(len(data["timestamps"]) - bars[position].n)
+                        resolved[source] = (directory, data)
+                        # Container frame counts are estimates.  Make the
+                        # finished line honestly read 100%, even if a decoder
+                        # produced one fewer (or more) frame.
+                        bars[position].total = bars[position].n
+                        bars[position].refresh()
+        finally:
+            for bar in bars:
+                bar.close()
     return [resolved[(base / tr["source"]).resolve()] for tr in d["tracks"]]
 
 
