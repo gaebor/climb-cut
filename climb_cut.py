@@ -617,15 +617,36 @@ def preview(path: Path, scale: float = .5, cache_height: int = 720) -> None:
         cv2.destroyAllWindows()
 
 
-def render(path: Path, out: Path) -> None:
+def render(path: Path, out: Path, single_threaded: bool = False) -> None:
     d = load(path); base = path.parent; fps = 30.0
     width, height = d.get("output", {}).get("size", [1080, 1920])
     out.parent.mkdir(parents=True, exist_ok=True)
     # The PTS index makes frame selection exact even for variable-frame-rate sources.
     caches = descriptor_caches(d, base, None)
+    total_frames = math.ceil(output_duration(d) * fps)
+    if single_threaded:
+        # Reference path for measuring the benefit of the pipelined renderer:
+        # all source decoding, transforms, blending, and encoding happen on
+        # this thread in output-frame order.
+        readers = [IndexedSourceReader((base / track["source"]).resolve(), cache)
+                   for track, (_, cache) in zip(d["tracks"], caches)]
+        writer = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            for reader in readers: reader.close()
+            raise RuntimeError("VideoWriter failed to open")
+        try:
+            with tqdm(total=total_frames, desc="Render output (single thread)", unit="frame", dynamic_ncols=True) as progress:
+                for i in range(total_frames):
+                    writer.write(render_frame(d, readers, i / fps))
+                    progress.update(1)
+        finally:
+            writer.release()
+            for reader in readers: reader.close()
+        print(f"\nWrote {out}")
+        return
+
     workers = [TrackRenderWorker(d, track, (base / track["source"]).resolve(), cache, (width, height)) for track, (_, cache) in zip(d["tracks"], caches)]
     encoder = VideoEncoder(out, fps, (width, height))
-    total_frames = math.ceil(output_duration(d) * fps)
     try:
         for worker in workers: worker.start()
         encoder.start()
@@ -681,12 +702,12 @@ def main() -> None:
             q.add_argument("--scale", type=float, default=.5, help="display scale, 0.1 to 1.0 (default: 0.5)")
             q.add_argument("--cache-height", type=int, default=720, help="height of cached preview JPEGs (default: 720)")
         if name == "cache": q.add_argument("--height", type=int, default=720, help="height of JPEG preview frames (default: 720)")
-    q = sp.add_parser("render", help="render final fixed-30-FPS MP4 with OpenCV"); q.add_argument("descriptor", type=Path); q.add_argument("--output", type=Path, required=True)
+    q = sp.add_parser("render", help="render final fixed-30-FPS MP4 with OpenCV"); q.add_argument("descriptor", type=Path); q.add_argument("--output", type=Path, required=True); q.add_argument("--single-threaded", action="store_true", help="use the sequential reference renderer for benchmarking")
     ns = p.parse_args()
     if ns.command == "init": make_seed(ns.descriptor, ns.videos, ns.route)
     elif ns.command == "validate": load(ns.descriptor); print("Descriptor is valid")
     elif ns.command == "cache": cache_descriptor(ns.descriptor, ns.height)
     elif ns.command == "preview": preview(ns.descriptor, ns.scale, ns.cache_height)
-    elif ns.command == "render": render(ns.descriptor, ns.output)
+    elif ns.command == "render": render(ns.descriptor, ns.output, ns.single_threaded)
 
 if __name__ == "__main__": main()
