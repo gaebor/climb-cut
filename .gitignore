@@ -1,0 +1,16 @@
+# Local climbing media and route-specific work
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.json
+clips/
+routes/
+renders/
+projects/
+1789913795308/
+
+# Python environment and generated files
+.venv/
+__pycache__/
+*.py[cod]

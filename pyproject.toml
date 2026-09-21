@@ -1,0 +1,9 @@
+[project]
+name = "climb-cut"
+version = "0.1.0"
+description = "Piecewise-synchronised climbing-attempt compositor"
+requires-python = ">=3.10"
+dependencies = ["opencv-python>=4.8"]
+
+[tool.uv]
+package = false
