@@ -11,7 +11,7 @@ uv run python climb_cut.py init yellow-arete.json 20260915_101609.mp4 20260915_1
 uv run python climb_cut.py preview yellow-arete.json
 ```
 
-Before reviewing, build the fast preview cache once. This creates a `clips/<video-name>/` folder next to your descriptor, containing a small JPEG for every decoded input frame. JPEG names are their source presentation timestamps, and `index.json` maps timestamps to files. It may take a little while and use disk space, but all later seeking is cache-backed:
+Before reviewing, build the fast preview cache once. This creates a `clips/<video-name>/` folder next to your descriptor, containing a small JPEG for every decoded input frame. JPEG names are their source presentation timestamps, and `index.json` maps timestamps to files. Missing source videos are cached in separate processes, with one tqdm bar per video. It may take a little while and use disk space, but all later seeking is cache-backed:
 
 ```powershell
 uv run python climb_cut.py cache yellow-arete.json --height 720
@@ -48,6 +48,6 @@ uv run python climb_cut.py validate yellow-arete.json
 uv run python climb_cut.py render yellow-arete.json --output renders/yellow-arete-preview.mp4
 ```
 
-The OpenCV renderer is the final deterministic renderer. It emits exactly 30 output frames per second; frame `n` has output time `n / 30`. For each track it maps that time through the hold anchors, chooses the most recent input frame at or before that decoded source timestamp, and blends it with the normalised opacity. It does not create interpolated source frames, so variable/uneven source frame rates are preserved rather than flattened into nominal-FPS timing.
+The OpenCV renderer is the final deterministic renderer. It emits exactly 30 output frames per second; frame `n` has output time `n / 30`. For each track it maps that time through the hold anchors, chooses the most recent input frame at or before that decoded source timestamp, and blends it with the normalised opacity. It does not create interpolated source frames, so variable/uneven source frame rates are preserved rather than flattened into nominal-FPS timing. Final renders use one bounded decode/transform worker per track and a separate bounded encoder worker; no track can run more than one output frame ahead of the compositor.
 
 `init` does not guess where a climb begins: its `start` value is deliberately a whole-video placeholder. Set it to the real climbing moment before judging alignment. Add shared holds only where you want a retimed interval; no finish anchor is needed.

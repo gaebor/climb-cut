@@ -7,17 +7,22 @@ short, reviewable JSON change.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+from tqdm import tqdm
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -181,7 +186,7 @@ def source_signature(source: Path) -> dict[str, int]:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
-def build_frame_cache(source: Path, directory: Path, max_height: int = 720) -> dict[str, Any]:
+def build_frame_cache(source: Path, directory: Path, max_height: int = 720, progress_position: int = 0) -> dict[str, Any]:
     """Decode once and save a timestamp-indexed, preview-sized JPEG cache."""
     directory.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(source))
@@ -189,6 +194,8 @@ def build_frame_cache(source: Path, directory: Path, max_height: int = 720) -> d
     timestamps: list[float] = []
     files: list[str] = []
     frame_number = 0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+    progress = tqdm(total=total, desc=f"Cache {source.name}", unit="frame", position=progress_position, leave=True, dynamic_ncols=True)
     try:
         while True:
             ok, image = cap.read()
@@ -207,27 +214,57 @@ def build_frame_cache(source: Path, directory: Path, max_height: int = 720) -> d
             cv2.imwrite(str(directory / filename), image, [cv2.IMWRITE_JPEG_QUALITY, 88])
             files.append(filename)
             frame_number += 1
-            if frame_number % 100 == 0: print(f"\rCaching {source.name}: {frame_number} frames", end="", flush=True)
+            progress.update(1)
     finally:
         cap.release()
+        progress.close()
     data = {"version": 2, "source": str(source.resolve()), "signature": source_signature(source),
             "max_height": max_height, "timestamps": timestamps, "files": files}
     (directory / "index.json").write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
-    print(f"\rCached {source.name}: {frame_number} frames{' ' * 20}")
     return data
 
 
-def load_frame_cache(descriptor_dir: Path, source: Path, max_height: int | None = 720) -> tuple[Path, dict[str, Any]]:
+def initialise_cache_worker(progress_lock: Any) -> None:
+    """Give independently spawned cache processes one shared tqdm lock."""
+    tqdm.set_lock(progress_lock)
+
+
+def existing_frame_cache(descriptor_dir: Path, source: Path, max_height: int | None = 720) -> tuple[Path, dict[str, Any] | None]:
     directory = cache_path(descriptor_dir, source); index = directory / "index.json"
     if index.exists():
         data = json.loads(index.read_text(encoding="utf-8"))
         if data.get("version") == 2 and data.get("signature") == source_signature(source) and (max_height is None or data.get("max_height") == max_height):
             return directory, data
-    return directory, build_frame_cache(source, directory, max_height or 720)
+    return directory, None
+
+
+def load_frame_cache(descriptor_dir: Path, source: Path, max_height: int | None = 720) -> tuple[Path, dict[str, Any]]:
+    directory, data = existing_frame_cache(descriptor_dir, source, max_height)
+    return directory, data or build_frame_cache(source, directory, max_height or 720)
 
 
 def descriptor_caches(d: dict[str, Any], base: Path, max_height: int | None = 720) -> list[tuple[Path, dict[str, Any]]]:
-    return [load_frame_cache(base, (base / tr["source"]).resolve(), max_height) for tr in d["tracks"]]
+    sources = list(dict.fromkeys((base / tr["source"]).resolve() for tr in d["tracks"]))
+    resolved: dict[Path, tuple[Path, dict[str, Any]]] = {}
+    missing: list[tuple[Path, Path]] = []
+    for source in sources:
+        directory, data = existing_frame_cache(base, source, max_height)
+        if data is None: missing.append((source, directory))
+        else: resolved[source] = (directory, data)
+    if missing:
+        # Cache jobs share neither decoder state nor pixels. Separate Python
+        # processes bypass the GIL and give FFmpeg/JPEG work independent CPU
+        # scheduling; the manager lock keeps the per-video tqdm bars tidy.
+        with mp.Manager() as manager:
+            progress_lock = manager.RLock()
+            tqdm.set_lock(progress_lock)
+            with ProcessPoolExecutor(max_workers=len(missing), initializer=initialise_cache_worker, initargs=(progress_lock,)) as pool:
+                futures = {pool.submit(build_frame_cache, source, directory, max_height or 720, position): (source, directory)
+                           for position, (source, directory) in enumerate(missing)}
+                for future in as_completed(futures):
+                    source, directory = futures[future]
+                    resolved[source] = (directory, future.result())
+    return [resolved[(base / tr["source"]).resolve()] for tr in d["tracks"]]
 
 
 def source_frame_index(timestamps: np.ndarray, seconds: float) -> int:
@@ -282,23 +319,122 @@ class IndexedSourceReader:
     def close(self) -> None: self.cap.release()
 
 
+def transformed_track_frame(d: dict[str, Any], tr: dict[str, Any], reader: Any, t: float, size: tuple[int, int], weight: float) -> np.ndarray | None:
+    native_width, native_height = d.get("output", {}).get("size", [1080, 1920])
+    width, height = size
+    if weight == 0: return None
+    img = reader.frame(source_time(d, tr, t))
+    if img is None: return None
+    if img.shape[:2] == (height, width):
+        positioned = img
+    else:
+        positioned = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+    dx, dy = tr.get("translation", [0, 0])
+    if dx or dy:
+        # Translation is in final-output pixels, so scale it for the smaller
+        # preview canvas while keeping renders pixel-accurate.
+        matrix = np.float32([[1, 0, dx * width / native_width], [0, 1, dy * height / native_height]])
+        positioned = cv2.warpAffine(positioned, matrix, (width, height), borderMode=cv2.BORDER_CONSTANT)
+    return positioned.astype(np.float32) * weight
+
+
 def render_frame(d: dict[str, Any], readers: list[Any], t: float, size: tuple[int, int] | None = None) -> np.ndarray:
     native_width, native_height = d.get("output", {}).get("size", [1080, 1920])
     width, height = size or (native_width, native_height)
     canvas = np.zeros((height, width, 3), dtype=np.float32)
     source_ends = [reader.source_end for reader in readers]
     for tr, reader, weight in zip(d["tracks"], readers, weights(d, t, source_ends)):
-        if weight == 0: continue
-        img = reader.frame(source_time(d, tr, t))
-        if img is not None:
-            positioned = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
-            dx, dy = tr.get("translation", [0, 0])
-            # Translation is in final-output pixels, so scale it for the
-            # smaller preview canvas while keeping renders pixel-accurate.
-            matrix = np.float32([[1, 0, dx * width / native_width], [0, 1, dy * height / native_height]])
-            positioned = cv2.warpAffine(positioned, matrix, (width, height), borderMode=cv2.BORDER_CONSTANT)
-            canvas += positioned.astype(np.float32) * weight
+        frame = transformed_track_frame(d, tr, reader, t, (width, height), weight)
+        if frame is not None: canvas += frame
     return np.uint8(np.clip(canvas, 0, 255))
+
+
+class TrackRenderWorker:
+    """One bounded decode/transform pipeline for a single source track."""
+    def __init__(self, d: dict[str, Any], track: dict[str, Any], source: Path, cache: dict[str, Any], size: tuple[int, int], queue_size: int = 1):
+        self.d, self.track, self.source, self.cache, self.size = d, track, source, cache, size
+        self.tasks: queue.Queue[tuple[int, float, float] | None] = queue.Queue(maxsize=queue_size)
+        self.results: queue.Queue[tuple[int, np.ndarray | None, Exception | None]] = queue.Queue(maxsize=queue_size)
+        self.ready = threading.Event()
+        self.error: Exception | None = None
+        self.thread = threading.Thread(target=self._run, name=f"decode-{track['id']}", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start(); self.ready.wait()
+        if self.error: raise RuntimeError(f"Cannot start track {self.track['id']}") from self.error
+
+    def _run(self) -> None:
+        try:
+            reader = IndexedSourceReader(self.source, self.cache)
+        except Exception as error:
+            self.error = error; self.ready.set(); return
+        self.ready.set()
+        try:
+            while (task := self.tasks.get()) is not None:
+                index, t, weight = task
+                try:
+                    self.results.put((index, transformed_track_frame(self.d, self.track, reader, t, self.size, weight), None))
+                except Exception as error:
+                    self.results.put((index, None, error))
+        finally:
+            reader.close()
+
+    def submit(self, index: int, t: float, weight: float) -> None:
+        self.tasks.put((index, t, weight))
+
+    def result(self, index: int) -> np.ndarray | None:
+        result_index, frame, error = self.results.get()
+        if error: raise RuntimeError(f"Track {self.track['id']} failed on output frame {index}") from error
+        if result_index != index: raise RuntimeError("Track worker returned frames out of order")
+        return frame
+
+    def close(self) -> None:
+        self.tasks.put(None); self.thread.join()
+
+
+class VideoEncoder:
+    """A bounded writer thread so encoding overlaps the next frame's decoding."""
+    def __init__(self, path: Path, fps: float, size: tuple[int, int], queue_size: int = 2):
+        self.path, self.fps, self.size = path, fps, size
+        self.frames: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=queue_size)
+        self.ready = threading.Event()
+        self.error: Exception | None = None
+        self.thread = threading.Thread(target=self._run, name="encode", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start(); self.ready.wait()
+        if self.error: raise RuntimeError("Could not create output video") from self.error
+
+    def _run(self) -> None:
+        width, height = self.size
+        writer = cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (width, height))
+        if not writer.isOpened():
+            self.error = RuntimeError("VideoWriter failed to open"); self.ready.set(); return
+        self.ready.set()
+        try:
+            while (frame := self.frames.get()) is not None:
+                writer.write(frame)
+        except Exception as error:
+            self.error = error
+        finally:
+            writer.release()
+
+    def submit(self, frame: np.ndarray) -> None:
+        while True:
+            if self.error: raise RuntimeError("Encoder failed") from self.error
+            try:
+                self.frames.put(frame, timeout=.1); return
+            except queue.Full: pass
+
+    def close(self) -> None:
+        while self.thread.is_alive():
+            try:
+                self.frames.put(None, timeout=.1)
+                break
+            except queue.Full:
+                if self.error: break
+        self.thread.join()
+        if self.error: raise RuntimeError("Encoder failed") from self.error
 
 
 HELP = """Keys: space play/pause | left/right ±1 output frame | up/down ±0.5s | g snap nearest anchor | -/= preview zoom
@@ -444,19 +580,29 @@ def render(path: Path, out: Path) -> None:
     d = load(path); base = path.parent; fps = 30.0
     width, height = d.get("output", {}).get("size", [1080, 1920])
     out.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(out), fourcc, fps, (width, height))
-    if not writer.isOpened(): raise RuntimeError("Could not create output video")
     # The PTS index makes frame selection exact even for variable-frame-rate sources.
     caches = descriptor_caches(d, base, None)
-    readers = [IndexedSourceReader((base / tr["source"]).resolve(), cache) for tr, (_, cache) in zip(d["tracks"], caches)]
+    workers = [TrackRenderWorker(d, track, (base / track["source"]).resolve(), cache, (width, height)) for track, (_, cache) in zip(d["tracks"], caches)]
+    encoder = VideoEncoder(out, fps, (width, height))
+    total_frames = math.ceil(output_duration(d) * fps)
     try:
-        for i in range(math.ceil(output_duration(d) * fps)):
-            writer.write(render_frame(d, readers, i/fps))
-            if i % int(fps) == 0: print(f"\rRendering {i/fps:.0f}s", end="", flush=True)
+        for worker in workers: worker.start()
+        encoder.start()
+        with tqdm(total=total_frames, desc="Render output", unit="frame", dynamic_ncols=True) as progress:
+            for i in range(total_frames):
+                t = i / fps
+                source_ends = [worker.cache["timestamps"][-1] for worker in workers]
+                for worker, weight in zip(workers, weights(d, t, source_ends)):
+                    worker.submit(i, t, weight)
+                canvas = np.zeros((height, width, 3), dtype=np.float32)
+                for worker in workers:
+                    frame = worker.result(i)
+                    if frame is not None: canvas += frame
+                encoder.submit(np.uint8(np.clip(canvas, 0, 255)))
+                progress.update(1)
     finally:
-        writer.release()
-        for r in readers: r.close()
+        for worker in workers: worker.close()
+        encoder.close()
     print(f"\nWrote {out}")
 
 
