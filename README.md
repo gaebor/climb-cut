@@ -50,4 +50,14 @@ uv run python climb_cut.py render yellow-arete.json --output renders/yellow-aret
 
 The OpenCV renderer is the final deterministic renderer. It emits exactly 30 output frames per second; frame `n` has output time `n / 30`. For each track it maps that time through the hold anchors, chooses the most recent input frame at or before that decoded source timestamp, and blends it with the normalised opacity. It does not create interpolated source frames, so variable/uneven source frame rates are preserved rather than flattened into nominal-FPS timing. Final renders use one bounded decode/transform worker per track and a separate bounded encoder worker; no track can run more than one output frame ahead of the compositor.
 
+## Verify render equivalence
+
+The test suite generates two small synthetic input clips, renders them through both renderer paths, and compares every decoded output frame pixel-for-pixel:
+
+```powershell
+uv run python -m unittest tests/test_render_determinism.py -v
+```
+
+For a manual sequential performance baseline on a real route, add `--single-threaded` to `render`.
+
 `init` does not guess where a climb begins: its `start` value is deliberately a whole-video placeholder. Set it to the real climbing moment before judging alignment. Add shared holds only where you want a retimed interval; no finish anchor is needed.

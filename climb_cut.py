@@ -204,12 +204,11 @@ def build_frame_cache(source: Path, directory: Path, max_height: int = 720,
     files: list[str] = []
     frame_number = 0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
-    # A process may not write a tqdm bar directly: Windows terminals cannot
+    # A worker may not write a tqdm bar directly: Windows terminals cannot
     # reliably interleave their cursor-control sequences.  In that case the
     # parent process owns the bars and receives small batched increments.
     progress = None if progress_queue is not None else tqdm(
         total=total, desc=f"Cache {source.name}", unit="frame", dynamic_ncols=True)
-    pending_progress = 0
     try:
         while True:
             ok, image = cap.read()
@@ -231,16 +230,16 @@ def build_frame_cache(source: Path, directory: Path, max_height: int = 720,
             if progress is not None:
                 progress.update(1)
             else:
-                pending_progress += 1
-                if pending_progress >= 16:
-                    progress_queue.put((progress_id, pending_progress))
-                    pending_progress = 0
+                # Cumulative counts tolerate a late queue message after the
+                # worker has completed; the parent can simply ignore it.
+                if frame_number % 16 == 0:
+                    progress_queue.put((progress_id, frame_number))
     finally:
         cap.release()
         if progress is not None:
             progress.close()
-        elif pending_progress:
-            progress_queue.put((progress_id, pending_progress))
+        else:
+            progress_queue.put((progress_id, frame_number))
     data = {"version": 2, "source": str(source.resolve()), "signature": source_signature(source),
             "max_height": max_height, "timestamps": timestamps, "files": files}
     (directory / "index.json").write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
@@ -275,6 +274,7 @@ def descriptor_caches(d: dict[str, Any], base: Path, max_height: int | None = 72
         # overhead. Only this parent thread draws tqdm bars, avoiding garbled
         # cursor sequences from concurrent workers.
         updates: queue.Queue[tuple[int, int]] = queue.Queue()
+        reported = [0] * len(missing)
         bars = [tqdm(total=reported_frame_count(source),
                      desc=f"Cache {source.name}", unit="frame", position=position,
                      leave=True, dynamic_ncols=True)
@@ -286,16 +286,20 @@ def descriptor_caches(d: dict[str, Any], base: Path, max_height: int | None = 72
                 while futures:
                     try:
                         while True:
-                            position, amount = updates.get_nowait()
-                            bars[position].update(amount)
+                                position, count = updates.get_nowait()
+                                if count > reported[position]:
+                                    bars[position].update(count - reported[position])
+                                    reported[position] = count
                     except queue.Empty:
                         pass
                     done, _ = wait(futures, timeout=.1, return_when=FIRST_COMPLETED)
                     for future in done:
                         source, directory, position = futures.pop(future)
                         data = future.result()
-                        if bars[position].n < len(data["timestamps"]):
-                            bars[position].update(len(data["timestamps"]) - bars[position].n)
+                        actual = len(data["timestamps"])
+                        if actual > reported[position]:
+                            bars[position].update(actual - reported[position])
+                            reported[position] = actual
                         resolved[source] = (directory, data)
                         # Container frame counts are estimates.  Make the
                         # finished line honestly read 100%, even if a decoder
